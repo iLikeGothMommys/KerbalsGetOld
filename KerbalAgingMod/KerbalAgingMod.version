@@ -1,20 +1,20 @@
 {
-  "NAME": AgingMod
-  "URL": "https://github.com/iLikeGothMommys/KerbalAgeMod",
-  "DOWNLOAD": "https://github.com/linuxgurugamer/ClickThroughBlocker/releases",
+  "NAME": KerbalAgingMod
+  "URL": "hhttps://github.com/iLikeGothMommys/KerbalAgeMod/blob/main/KerbalAgingMod/KerbalAgingMod.version",
+  "DOWNLOAD": "https://github.com/iLikeGothMommys/KerbalAgeMod/releases",
   "GITHUB": {
-    "USERNAME": "linuxgurugamer",
-    "REPOSITORY": "ClickThroughBlocker"
+    "USERNAME": "iLikeGothMommys",
+    "REPOSITORY": "KerbalAgeMod"
   },
   "VERSION": {
-    "MAJOR": 2,
-    "MINOR": 1,
-    "PATCH": 10,
-    "BUILD": 22
+    "MAJOR": 1,
+    "MINOR": 0,
+    "PATCH": 0,
+    "BUILD": 1
   },
   "KSP_VERSION_MIN": {
     "MAJOR": 1,
-    "MINOR": 11,
+    "MINOR": 8,
     "PATCH": 0
   },
   "KSP_VERSION_MAX": {
@@ -23,3 +23,4 @@
     "PATCH": 99
   }
 }
+

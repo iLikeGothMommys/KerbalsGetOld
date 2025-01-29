@@ -12,9 +12,10 @@ using AGING_DFWrapper;  // For DeepFreeze integration
 //  • Assigns kerbal ages with user-configurable start & death ranges (default death 350..370).
 //  • Assigns each Kerbal a random birthday (day between 1 and 425).
 //  • Calculates and stores a static birth year based on the year they were added minus their age.
-//  • If the kerbal was already dead before we assign them an age, we randomly pick 23..80 and put them in Deceased tab.
-//  • If a kerbal dies externally (e.g., TAC LS) after we've assigned them, we detect the roster status change
-//    and move them from Alive to Deceased with the final age they had at the time of death.
+//  • If the kerbal was already dead before we assign them an age (or discovered in the scanning method),
+//    we randomly pick 23..80, put them in Deceased tab, and mark birth/death as UNKNOWN.
+//  • If a kerbal dies *while the mod is running* (e.g., old age, TAC LS, etc.), we detect it immediately
+//    (via onKerbalStatusChange) and mark them with a proper final age and *known* death date.
 //  • Lock Settings, Debug Menu, near-death color highlighting, etc.
 //  • Ages increase only on the assigned birthday each Kerbin year.
 //  • Displays each Kerbal's static birth year and birthday in the GUI.
@@ -29,29 +30,29 @@ using AGING_DFWrapper;  // For DeepFreeze integration
 )]
 public class KerbalAgingMod : ScenarioModule
 {
-    // UI Styles for prettier appearance
+    // UI Styles
     private GUIStyle headerStyle;
     private GUIStyle rowStyle;
     private GUIStyle columnStyle;
-    private GUIStyle statusStyle;  // Dedicated style for the STATUS column
+    private GUIStyle statusStyle;  // For the STATUS column in the list
 
     // -----------------------------------------------------------------------
-    // 1. Internal Data for Each Kerbal
+    // 1. Internal Data Class
     // -----------------------------------------------------------------------
     private class KerbalData
     {
         public int currentAge;
         public int deathAge;
         public bool isAlive;
-        public int birthday;
-        public int yearAdded;
-        public int birthYear;
+        public int birthday;     // 1..426
+        public int yearAdded;    // The year they joined or were discovered
+        public int birthYear;    // Calculated = yearAdded - currentAge
         public bool blessed;
-        public bool immortal;   // Immortal flag for debug
+        public bool immortal;    // Immortal for debug
 
-        public double deathUT;
-        public bool unknownDeath;
-        public bool unknownBirth;
+        public double deathUT;   // UT of death
+        public bool unknownDeath;  // If death date was discovered after the fact
+        public bool unknownBirth;  // If birth date was never assigned
     }
 
     private Dictionary<string, KerbalData> kerbalAges = new Dictionary<string, KerbalData>();
@@ -84,7 +85,7 @@ public class KerbalAgingMod : ScenarioModule
     private ApplicationLauncherButton appButton;
 
     // -----------------------------------------------------------------------
-    // 5. IMGUI Window Fields
+    // 5. IMGUI Window
     // -----------------------------------------------------------------------
     private bool showGUI = false;
     private Rect windowRect = new Rect(100, 100, 720, 500);
@@ -104,63 +105,33 @@ public class KerbalAgingMod : ScenarioModule
 
     private Vector2 settingsScrollPos = Vector2.zero;
 
-    // DeepFreeze integration states
+    // DeepFreeze integration
     private bool dfInitialized = false;
     private bool dfInitAttempted = false;
 
-    // Reordered enum to match desired cycle order
+    // Sorting
     private enum SortMode { OldestFirst, YoungestFirst, AZ, ZA, Frozen }
     private SortMode currentSort = SortMode.OldestFirst;
 
-    private void CycleSortMode()
-    {
-        int enumCount = Enum.GetNames(typeof(SortMode)).Length;
-        do
-        {
-            currentSort = (SortMode)(((int)currentSort + 1) % enumCount);
-        } while (currentSort == SortMode.Frozen && (!DFWrapper.APIReady || !HasFrozenKerbals()));
-    }
-
-    private string GetSortLabel()
-    {
-        switch (currentSort)
-        {
-            case SortMode.AZ: return "A to Z";
-            case SortMode.ZA: return "Z to A";
-            case SortMode.OldestFirst: return "Oldest First";
-            case SortMode.YoungestFirst: return "Youngest First";
-            case SortMode.Frozen: return "Frozen";
-            default: return "";
-        }
-    }
-
-    private bool HasFrozenKerbals()
-    {
-        try
-        {
-            if (DFWrapper.APIReady)
-            {
-                var frozen = DFWrapper.DeepFreezeAPI.FrozenKerbals;
-                return frozen != null && frozen.Count > 0;
-            }
-        }
-        catch (Exception) { }
-        return false;
-    }
-
+    // -----------------------------------------------------------------------
+    // Setup and Teardown
+    // -----------------------------------------------------------------------
     public override void OnAwake()
     {
         base.OnAwake();
         GameEvents.onGUIApplicationLauncherReady.Add(OnAppLauncherReady);
 
-        // Subscribe to onKerbalStatusChange instead of onCrewKilled,
-        // as it will reliably give us a ProtoCrewMember
+        // Listen for changes to kerbals' status
         GameEvents.onKerbalStatusChange.Add(OnKerbalStatusChange);
     }
 
     public override void OnLoad(ConfigNode node)
     {
         base.OnLoad(node);
+
+        // -------------------------
+        // 1) Load existing mod data
+        // -------------------------
         ConfigNode ageNode = node.GetNode("KERBAL_AGE_DATA");
         if (ageNode != null)
         {
@@ -171,6 +142,7 @@ public class KerbalAgingMod : ScenarioModule
                 int currentAge = int.Parse(kNode.GetValue("currentAge"));
                 int dAge = int.Parse(kNode.GetValue("deathAge"));
                 bool isAlive = bool.Parse(kNode.GetValue("isAlive"));
+
                 int birthday = 1;
                 int yearAdded = (int)(Planetarium.GetUniversalTime() / KERBIN_YEAR_SECONDS) + 1;
                 int birthYear = 0;
@@ -214,6 +186,9 @@ public class KerbalAgingMod : ScenarioModule
             }
         }
 
+        // -------------------------
+        // 2) Load other mod settings
+        // -------------------------
         if (node.HasValue("startAgeMin")) int.TryParse(node.GetValue("startAgeMin"), out startAgeMin);
         if (node.HasValue("startAgeMax")) int.TryParse(node.GetValue("startAgeMax"), out startAgeMax);
         if (node.HasValue("deathAgeMin")) int.TryParse(node.GetValue("deathAgeMin"), out deathAgeMin);
@@ -224,14 +199,21 @@ public class KerbalAgingMod : ScenarioModule
         startAgeMaxStr = startAgeMax.ToString();
         deathAgeMinStr = deathAgeMin.ToString();
         deathAgeMaxStr = deathAgeMax.ToString();
+
+        // -------------------------
+        // 3) Scan for kerbals that are already dead
+        // -------------------------
+        ScanForKerbalsMarkedDead();
     }
 
     public override void OnSave(ConfigNode node)
     {
         base.OnSave(node);
+
         ConfigNode ageNode = node.HasNode("KERBAL_AGE_DATA")
             ? node.GetNode("KERBAL_AGE_DATA")
             : node.AddNode("KERBAL_AGE_DATA");
+
         ageNode.ClearData();
         ageNode.ClearNodes();
 
@@ -262,8 +244,6 @@ public class KerbalAgingMod : ScenarioModule
     public void OnDestroy()
     {
         GameEvents.onGUIApplicationLauncherReady.Remove(OnAppLauncherReady);
-
-        // Unsubscribe from the kerbal status change event
         GameEvents.onKerbalStatusChange.Remove(OnKerbalStatusChange);
 
         if (appButton != null && ApplicationLauncher.Instance != null)
@@ -273,6 +253,9 @@ public class KerbalAgingMod : ScenarioModule
         }
     }
 
+    // -----------------------------------------------------------------------
+    // 6. Main Update Loop
+    // -----------------------------------------------------------------------
     public void Update()
     {
         double currentUT = Planetarium.GetUniversalTime();
@@ -301,17 +284,18 @@ public class KerbalAgingMod : ScenarioModule
         lastUpdateUT = currentUT;
     }
 
+    // -----------------------------------------------------------------------
+    // 7. Detect Kerbal Death
+    // -----------------------------------------------------------------------
     /// <summary>
-    /// Detect when a kerbal's roster status changes to Dead, which happens
-    /// both for old-age deaths and external mod deaths (TAC-LS, etc).
-    /// This is more reliable than onCrewKilled for many KSP versions.
+    /// Called whenever a kerbal’s status changes. If going from alive to Dead
+    /// under the mod's watch, we record an actual death date (unknownDeath=false).
     /// </summary>
     private void OnKerbalStatusChange(ProtoCrewMember pcm, ProtoCrewMember.RosterStatus from, ProtoCrewMember.RosterStatus to)
     {
-        // If they changed status to Dead, mark them as dead in our dictionary
+        // If they changed status to Dead, mark them dead with a real date
         if (to == ProtoCrewMember.RosterStatus.Dead && from != ProtoCrewMember.RosterStatus.Dead)
         {
-            // If they're in our dictionary and believed "alive," fix that
             if (pcm != null && kerbalAges.ContainsKey(pcm.name))
             {
                 KerbalData data = kerbalAges[pcm.name];
@@ -319,12 +303,17 @@ public class KerbalAgingMod : ScenarioModule
                 {
                     data.isAlive = false;
                     data.deathAge = data.currentAge;
-                    MarkKerbalDead(pcm.name);
+
+                    // We discovered this death in real time => proper date
+                    MarkKerbalDead(pcm.name, discoveredOffline: false);
                 }
             }
         }
     }
 
+    // -----------------------------------------------------------------------
+    // 8. Assign Ages for New (or Frozen) Kerbals
+    // -----------------------------------------------------------------------
     private void EnsureKerbalAgesAssigned()
     {
         var roster = HighLogic.CurrentGame.CrewRoster.Crew;
@@ -332,7 +321,7 @@ public class KerbalAgingMod : ScenarioModule
 
         foreach (ProtoCrewMember pcm in roster)
         {
-            // Some mods add "Tourist" kerbals; skip or handle as desired
+            // Skip tourists if you like
             if (pcm.trait == "Tourist") continue;
 
             // If not in our dictionary, assign new data
@@ -341,7 +330,7 @@ public class KerbalAgingMod : ScenarioModule
                 int randomBirthday = UnityEngine.Random.Range(1, 426);
                 if (pcm.rosterStatus == ProtoCrewMember.RosterStatus.Dead)
                 {
-                    // Already dead, assign them a random final age
+                    // They were discovered as dead => unknown
                     int randomDeadAge = UnityEngine.Random.Range(23, 81);
                     kerbalAges[pcm.name] = new KerbalData
                     {
@@ -353,17 +342,16 @@ public class KerbalAgingMod : ScenarioModule
                         birthYear = currentYear - randomDeadAge,
                         blessed = false,
                         immortal = false,
-                        unknownBirth = true,
-                        unknownDeath = true,
+                        unknownBirth = true,   // never assigned
+                        unknownDeath = true,   // died before we saw them
                         deathUT = -1
                     };
                 }
                 else
                 {
-                    // They are alive or other status => random start
+                    // They are alive => assign normal range
                     int startAge = UnityEngine.Random.Range(startAgeMin, startAgeMax + 1);
-                    bool blessed = (UnityEngine.Random.Range(0, 50) == 0);
-                    if (blessed) Debug.Log($"Kerbal {pcm.name} assigned as blessed.");
+                    bool blessed = (UnityEngine.Random.Range(0, 50) == 0); // 1 in 50 chance
                     int baseDeathAge = UnityEngine.Random.Range(deathAgeMin, deathAgeMax + 1);
                     int dAge = blessed ? baseDeathAge + 50 : baseDeathAge;
 
@@ -385,18 +373,18 @@ public class KerbalAgingMod : ScenarioModule
             }
             else
             {
-                // Already in dictionary but the roster says "Dead" => force an update
+                // If the mod says they're alive, but the game says dead, fix that:
                 KerbalData data = kerbalAges[pcm.name];
                 if (data.isAlive && pcm.rosterStatus == ProtoCrewMember.RosterStatus.Dead)
                 {
                     data.isAlive = false;
                     data.deathAge = data.currentAge;
-                    MarkKerbalDead(pcm.name);
+                    MarkKerbalDead(pcm.name, discoveredOffline: true);
                 }
             }
         }
 
-        // Check for Kerbals that exist only in a frozen state via DeepFreeze
+        // Check for Kerbals in DeepFreeze
         if (dfInitialized && DFWrapper.APIReady)
         {
             var frozenList = DFWrapper.DeepFreezeAPI.FrozenKerbals;
@@ -408,7 +396,6 @@ public class KerbalAgingMod : ScenarioModule
                     int randomBirthday = UnityEngine.Random.Range(1, 426);
                     int startAge = UnityEngine.Random.Range(startAgeMin, startAgeMax + 1);
                     bool blessed = (UnityEngine.Random.Range(0, 50) == 0);
-                    if (blessed) Debug.Log($"Frozen Kerbal {name} assigned as blessed.");
                     int baseDeathAge = UnityEngine.Random.Range(deathAgeMin, deathAgeMax + 1);
                     int dAge = blessed ? baseDeathAge + 50 : baseDeathAge;
 
@@ -446,6 +433,9 @@ public class KerbalAgingMod : ScenarioModule
         return false;
     }
 
+    // -----------------------------------------------------------------------
+    // 9. Aging
+    // -----------------------------------------------------------------------
     private void IncrementKerbalAges(double startTime, double endTime)
     {
         foreach (var kvp in kerbalAges)
@@ -453,7 +443,7 @@ public class KerbalAgingMod : ScenarioModule
             KerbalData data = kvp.Value;
             if (!data.isAlive) continue;
 
-            // Skip aging if Kerbal is frozen
+            // Skip if frozen
             if (IsKerbalFrozen(kvp.Key))
                 continue;
 
@@ -465,7 +455,7 @@ public class KerbalAgingMod : ScenarioModule
                 if (!data.immortal)
                 {
                     data.isAlive = false;
-                    MarkKerbalDead(kvp.Key);
+                    MarkKerbalDead(kvp.Key, discoveredOffline: false);
                 }
             }
         }
@@ -476,6 +466,7 @@ public class KerbalAgingMod : ScenarioModule
         double year = KERBIN_YEAR_SECONDS;
         double daySeconds = 6.0 * 3600.0;
         int count = 0;
+
         int startYear = (int)(startUT / year);
         int endYear = (int)(endUT / year);
 
@@ -488,11 +479,20 @@ public class KerbalAgingMod : ScenarioModule
         return count;
     }
 
-    private void MarkKerbalDead(string kerbalName)
+    // -----------------------------------------------------------------------
+    // 10. Mark Kerbal Dead
+    // -----------------------------------------------------------------------
+    /// <summary>
+    /// Marks a kerbal as dead in both the roster and our dictionary.
+    /// If discoveredOffline == false, we set a real death date (unknownDeath=false).
+    /// If discoveredOffline == true, we set unknownDeath=true and don't record a UT.
+    /// </summary>
+    private void MarkKerbalDead(string kerbalName, bool discoveredOffline)
     {
         var pcm = HighLogic.CurrentGame?.CrewRoster?[kerbalName];
         if (pcm != null)
         {
+            // Remove from any vessel
             if (pcm.rosterStatus == ProtoCrewMember.RosterStatus.Assigned)
             {
                 Vessel vessel = null;
@@ -518,15 +518,88 @@ public class KerbalAgingMod : ScenarioModule
             }
             pcm.rosterStatus = ProtoCrewMember.RosterStatus.Dead;
         }
+
         if (kerbalAges.ContainsKey(kerbalName))
         {
             KerbalData data = kerbalAges[kerbalName];
             data.isAlive = false;
-            data.deathUT = Planetarium.GetUniversalTime();
-            data.unknownDeath = false;
+
+            if (discoveredOffline)
+            {
+                // We do not know exactly when they died => unknown
+                data.unknownDeath = true;
+                data.deathUT = -1;
+            }
+            else
+            {
+                // We discovered the death in real time => known date
+                data.unknownDeath = false;
+                data.deathUT = Planetarium.GetUniversalTime();
+            }
         }
     }
 
+    // -----------------------------------------------------------------------
+    // 11. Scan For Kerbals Already Dead (e.g. from old saves)
+    // -----------------------------------------------------------------------
+    private void ScanForKerbalsMarkedDead()
+    {
+        var roster = HighLogic.CurrentGame?.CrewRoster;
+        if (roster == null) return;
+
+        // Gather all kerbals from the existing lists
+        List<ProtoCrewMember> allKerbals = new List<ProtoCrewMember>();
+        allKerbals.AddRange(roster.Crew);
+        allKerbals.AddRange(roster.Tourist);
+        allKerbals.AddRange(roster.Unowned);
+        allKerbals.AddRange(roster.Applicants);
+        // Remove these lines if your version of KSP doesn’t have them:
+        // allKerbals.AddRange(roster.Killed);
+        // allKerbals.AddRange(roster.Missing);
+
+        // If they are flagged Dead by the game but not in our dictionary (or incorrectly in our dictionary),
+        // mark them with unknown death info.
+        foreach (ProtoCrewMember pcm in allKerbals)
+        {
+            if (pcm.rosterStatus == ProtoCrewMember.RosterStatus.Dead)
+            {
+                // If not in our dictionary => brand new discovery
+                if (!kerbalAges.TryGetValue(pcm.name, out KerbalData data))
+                {
+                    int randomDeadAge = UnityEngine.Random.Range(23, 81);
+                    kerbalAges[pcm.name] = new KerbalData
+                    {
+                        currentAge = randomDeadAge,
+                        deathAge = randomDeadAge,
+                        isAlive = false,
+                        birthday = UnityEngine.Random.Range(1, 426),
+                        yearAdded = (int)(Planetarium.GetUniversalTime() / KERBIN_YEAR_SECONDS) + 1,
+                        birthYear = 0,
+                        blessed = false,
+                        immortal = false,
+                        deathUT = -1,
+                        unknownDeath = true,
+                        unknownBirth = true
+                    };
+                }
+                else
+                {
+                    // In dictionary but says isAlive => must correct it
+                    if (data.isAlive)
+                    {
+                        data.isAlive = false;
+                        data.deathAge = data.currentAge;
+                        // Because we only just discovered it, treat it as unknown
+                        MarkKerbalDead(pcm.name, discoveredOffline: true);
+                    }
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 12. Stock App Launcher
+    // -----------------------------------------------------------------------
     private void OnAppLauncherReady()
     {
         if (ApplicationLauncher.Instance == null || appButton != null) return;
@@ -545,6 +618,9 @@ public class KerbalAgingMod : ScenarioModule
         );
     }
 
+    // -----------------------------------------------------------------------
+    // 13. OnGUI
+    // -----------------------------------------------------------------------
     public void OnGUI()
     {
         if (!showGUI) return;
@@ -597,7 +673,8 @@ public class KerbalAgingMod : ScenarioModule
     private Texture2D MakeTex(int width, int height, Color col)
     {
         Color[] pix = new Color[width * height];
-        for (int i = 0; i < pix.Length; i++) pix[i] = col;
+        for (int i = 0; i < pix.Length; i++)
+            pix[i] = col;
         Texture2D result = new Texture2D(width, height);
         result.SetPixels(pix);
         result.Apply();
@@ -635,6 +712,9 @@ public class KerbalAgingMod : ScenarioModule
         GUI.DragWindow();
     }
 
+    // -----------------------------------------------------------------------
+    // 14. Kerbal List GUI
+    // -----------------------------------------------------------------------
     private void DrawKerbalListTab()
     {
         GUILayout.BeginHorizontal();
@@ -675,6 +755,7 @@ public class KerbalAgingMod : ScenarioModule
             GUILayout.EndHorizontal();
         }
 
+        // Filter the dictionary
         List<KeyValuePair<string, KerbalData>> list = new List<KeyValuePair<string, KerbalData>>();
         foreach (var kvp in kerbalAges)
         {
@@ -685,6 +766,7 @@ public class KerbalAgingMod : ScenarioModule
             }
         }
 
+        // Sort
         switch (currentSort)
         {
             case SortMode.AZ:
@@ -699,9 +781,9 @@ public class KerbalAgingMod : ScenarioModule
                     int ageComparison = b.Value.currentAge.CompareTo(a.Value.currentAge);
                     if (ageComparison != 0)
                         return ageComparison;
-                    // If ages are equal, compare birth years
-                    if (a.Value.birthYear != b.Value.birthYear)
-                        return a.Value.birthYear.CompareTo(b.Value.birthYear);
+                    // If same age, compare birthYear
+                    int yearCompare = a.Value.birthYear.CompareTo(b.Value.birthYear);
+                    if (yearCompare != 0) return yearCompare;
                     return a.Value.birthday.CompareTo(b.Value.birthday);
                 });
                 break;
@@ -711,9 +793,9 @@ public class KerbalAgingMod : ScenarioModule
                     int ageComparison = a.Value.currentAge.CompareTo(b.Value.currentAge);
                     if (ageComparison != 0)
                         return ageComparison;
-                    // If ages are equal, compare birth years
-                    if (a.Value.birthYear != b.Value.birthYear)
-                        return b.Value.birthYear.CompareTo(a.Value.birthYear);
+                    // If same, compare birthYear
+                    int yearCompare = b.Value.birthYear.CompareTo(a.Value.birthYear);
+                    if (yearCompare != 0) return yearCompare;
                     return a.Value.birthday.CompareTo(b.Value.birthday);
                 });
                 break;
@@ -738,7 +820,7 @@ public class KerbalAgingMod : ScenarioModule
     {
         GUILayout.BeginHorizontal(rowStyle);
 
-        // If alive and not immortal, color based on how close they are to death
+        // Color the name if they are close to death
         if (data.isAlive && !data.immortal)
         {
             int yearsLeft = data.deathAge - data.currentAge;
@@ -751,12 +833,14 @@ public class KerbalAgingMod : ScenarioModule
         }
         else
         {
-            // Deceased or immortal (no color changes)
+            // Deceased or immortal, no special color
             GUILayout.Label(kerbalName, GUILayout.Width(220));
         }
 
+        // Age
         GUILayout.Label(data.currentAge.ToString(), columnStyle, GUILayout.Width(100));
 
+        // Birth date
         string birthInfo;
         if (!data.isAlive && data.unknownBirth)
         {
@@ -766,6 +850,7 @@ public class KerbalAgingMod : ScenarioModule
         {
             if (data.birthYear <= 0)
             {
+                // Negative year means earlier than Year 1
                 int displayYear = -data.birthYear + 1;
                 birthInfo = $"Y{displayYear} B.S.C. DAY {data.birthday}";
             }
@@ -776,14 +861,16 @@ public class KerbalAgingMod : ScenarioModule
         }
         GUILayout.Label(birthInfo, columnStyle, GUILayout.Width(180));
 
-        // If alive and DF is installed, display "FROZEN" if so
-        if (currentTab == GuiTab.KerbalList && data.isAlive && DFWrapper.APIReady)
+        // If alive, show if Frozen
+        if (data.isAlive && DFWrapper.APIReady)
         {
             GUILayout.Label(IsKerbalFrozen(kerbalName) ? "FROZEN" : "", statusStyle, GUILayout.Width(100));
         }
 
+        // If dead, show date of death
         if (!data.isAlive)
         {
+            // Already have final currentAge as Age at Death
             string deathDateStr;
             if (data.unknownDeath || data.deathUT < 0)
             {
@@ -803,6 +890,45 @@ public class KerbalAgingMod : ScenarioModule
         GUILayout.EndHorizontal();
     }
 
+    private string GetSortLabel()
+    {
+        switch (currentSort)
+        {
+            case SortMode.AZ: return "A to Z";
+            case SortMode.ZA: return "Z to A";
+            case SortMode.OldestFirst: return "Oldest First";
+            case SortMode.YoungestFirst: return "Youngest First";
+            case SortMode.Frozen: return "Frozen";
+        }
+        return "";
+    }
+
+    private void CycleSortMode()
+    {
+        int enumCount = Enum.GetNames(typeof(SortMode)).Length;
+        do
+        {
+            currentSort = (SortMode)(((int)currentSort + 1) % enumCount);
+        } while (currentSort == SortMode.Frozen && (!DFWrapper.APIReady || !HasFrozenKerbals()));
+    }
+
+    private bool HasFrozenKerbals()
+    {
+        try
+        {
+            if (DFWrapper.APIReady)
+            {
+                var frozen = DFWrapper.DeepFreezeAPI.FrozenKerbals;
+                return frozen != null && frozen.Count > 0;
+            }
+        }
+        catch (Exception) { }
+        return false;
+    }
+
+    // -----------------------------------------------------------------------
+    // 15. Settings GUI
+    // -----------------------------------------------------------------------
     private void DrawSettingsTab()
     {
         settingsScrollPos = GUILayout.BeginScrollView(settingsScrollPos, GUILayout.ExpandHeight(true));
@@ -836,6 +962,7 @@ public class KerbalAgingMod : ScenarioModule
 
             GUILayout.Space(10);
 
+            // Debug menu
             showDebug = GUILayout.Toggle(showDebug, "Debug Menu");
             if (showDebug)
             {
@@ -887,21 +1014,22 @@ public class KerbalAgingMod : ScenarioModule
         if (int.TryParse(deathAgeMinStr, out tmp)) deathAgeMin = tmp;
         if (int.TryParse(deathAgeMaxStr, out tmp)) deathAgeMax = tmp;
 
-        // Enforce min <= max
+        // Ensure min <= max
         if (startAgeMin > startAgeMax) startAgeMax = startAgeMin;
         if (deathAgeMin > deathAgeMax) deathAgeMax = deathAgeMin;
 
-        // Update any currently living Kerbals
+        // Update any currently living kerbals
         foreach (var kvp in kerbalAges)
         {
             var data = kvp.Value;
             if (data.isAlive)
             {
                 data.deathAge = UnityEngine.Random.Range(deathAgeMin, deathAgeMax + 1);
+                // If the new range instantly kills them:
                 if (data.currentAge >= data.deathAge && !data.immortal)
                 {
                     data.isAlive = false;
-                    MarkKerbalDead(kvp.Key);
+                    MarkKerbalDead(kvp.Key, discoveredOffline: false);
                 }
             }
         }
@@ -910,12 +1038,15 @@ public class KerbalAgingMod : ScenarioModule
         GamePersistence.SaveGame(HighLogic.CurrentGame, "persistent", HighLogic.SaveFolder, SaveMode.OVERWRITE);
     }
 
+    // -----------------------------------------------------------------------
+    // 16. Debug Menu
+    // -----------------------------------------------------------------------
     private void DrawDebugMenu()
     {
         GUILayout.Label("Manual Kerbal Age Adjustment:");
         debugScrollPos = GUILayout.BeginScrollView(debugScrollPos, GUILayout.Height(150));
 
-        // List living kerbals to click for debug
+        // List living kerbals for clicking
         foreach (var kvp in kerbalAges)
         {
             var data = kvp.Value;
@@ -945,11 +1076,10 @@ public class KerbalAgingMod : ScenarioModule
                 debugAgeInput = GUILayout.TextField(debugAgeInput, GUILayout.Width(60), GUILayout.Height(22));
                 if (GUILayout.Button("Apply", GUILayout.Width(50)))
                 {
-                    int newAge;
-                    if (int.TryParse(debugAgeInput, out newAge))
+                    if (int.TryParse(debugAgeInput, out int newAge))
                     {
                         int currentYear = (int)(Planetarium.GetUniversalTime() / KERBIN_YEAR_SECONDS) + 1;
-                        // If we reduce age below current, pretend we "added" them more recently
+                        // If we reduce the age, pretend they joined more recently
                         if (newAge < data.currentAge)
                         {
                             data.yearAdded = currentYear;
@@ -957,16 +1087,17 @@ public class KerbalAgingMod : ScenarioModule
                         data.currentAge = Mathf.Max(0, newAge);
                         data.birthYear = data.yearAdded - data.currentAge;
 
+                        // If that kills them
                         if (data.currentAge >= data.deathAge && !data.immortal)
                         {
                             data.isAlive = false;
-                            MarkKerbalDead(selectedKerbal);
+                            MarkKerbalDead(selectedKerbal, discoveredOffline: false);
                         }
                     }
                 }
                 GUILayout.EndHorizontal();
 
-                // Example debug for adjusting "frozen time"
+                // Example: adjusting "frozen time"
                 if (data.isAlive && DFWrapper.APIReady)
                 {
                     GUILayout.BeginHorizontal();
@@ -974,15 +1105,13 @@ public class KerbalAgingMod : ScenarioModule
                     debugFrozenInput = GUILayout.TextField(debugFrozenInput, GUILayout.Width(60), GUILayout.Height(22));
                     if (GUILayout.Button("Apply", GUILayout.Width(50)))
                     {
-                        int frozenYears;
-                        if (int.TryParse(debugFrozenInput, out frozenYears))
+                        if (int.TryParse(debugFrozenInput, out int frozenYears))
                         {
-                            // A simplistic approach: just subtract from currentAge
                             data.currentAge = Mathf.Max(0, data.currentAge - frozenYears);
                             if (data.currentAge >= data.deathAge && !data.immortal)
                             {
                                 data.isAlive = false;
-                                MarkKerbalDead(selectedKerbal);
+                                MarkKerbalDead(selectedKerbal, discoveredOffline: false);
                             }
                         }
                     }
@@ -1002,7 +1131,7 @@ public class KerbalAgingMod : ScenarioModule
                     }
                     else
                     {
-                        // Un-bless: do not allow going below current age
+                        // Un-bless: don't allow going below currentAge
                         data.deathAge = Math.Max(data.currentAge + 1, data.deathAge - 50);
                     }
                 }
@@ -1019,15 +1148,5 @@ public class KerbalAgingMod : ScenarioModule
                 GUILayout.EndHorizontal();
             }
         }
-    }
-
-    private GUIStyle BoldCenteredLabel()
-    {
-        var style = new GUIStyle(GUI.skin.label)
-        {
-            fontStyle = FontStyle.Bold,
-            alignment = TextAnchor.MiddleCenter
-        };
-        return style;
     }
 }

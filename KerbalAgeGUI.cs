@@ -6,20 +6,6 @@ using KSP;
 using KSP.UI.Screens;
 using AGING_DFWrapper;  // For DeepFreeze integration
 
-//
-// KerbalAgingMod.cs
-// A single-file mod for Kerbal Space Program that:
-//  • Assigns kerbal ages with user-configurable start & death ranges (default death 350..370).
-//  • Assigns each Kerbal a random birthday (day between 1 and 425).
-//  • Calculates and stores a static birth year based on the year they were added minus their age.
-//  • If the kerbal was already dead before we assign them an age (or discovered in the scanning method),
-//    we randomly pick 23..80, put them in Deceased tab, and mark birth/death as UNKNOWN.
-//  • If a kerbal dies *while the mod is running* (e.g., old age, TAC LS, etc.), we detect it immediately
-//    (via onKerbalStatusChange) and mark them with a proper final age and *known* death date.
-//  • Lock Settings, Debug Menu, near-death color highlighting, etc.
-//  • Ages increase only on the assigned birthday each Kerbin year.
-//  • Displays each Kerbal's static birth year and birthday in the GUI.
-//
 [KSPScenario(
     ScenarioCreationOptions.AddToAllGames,
     new GameScenes[] {
@@ -109,6 +95,9 @@ public class KerbalAgingMod : ScenarioModule
     private bool dfInitialized = false;
     private bool dfInitAttempted = false;
 
+    // Flag to ensure FixFrozenMarkedDead is called only once
+    private bool fixedFrozenKerbals = false;
+
     // Sorting
     private enum SortMode { OldestFirst, YoungestFirst, AZ, ZA, Frozen }
     private SortMode currentSort = SortMode.OldestFirst;
@@ -139,6 +128,12 @@ public class KerbalAgingMod : ScenarioModule
             foreach (ConfigNode kNode in ageNode.GetNodes("KERBAL"))
             {
                 string name = kNode.GetValue("name");
+                ProtoCrewMember pcm = HighLogic.CurrentGame?.CrewRoster[name];
+
+                // Skip if kerbal is excluded (Tourist or Applicant) or does not exist in the roster
+                if (IsKerbalExcluded(pcm) || pcm == null)
+                    continue;
+
                 int currentAge = int.Parse(kNode.GetValue("currentAge"));
                 int dAge = int.Parse(kNode.GetValue("deathAge"));
                 bool isAlive = bool.Parse(kNode.GetValue("isAlive"));
@@ -183,6 +178,17 @@ public class KerbalAgingMod : ScenarioModule
                     unknownDeath = unknownDeath,
                     unknownBirth = unknownBirth
                 };
+            }
+
+            // **New Addition:** Remove any kerbals from the dictionary that are now excluded
+            List<string> excludedKerbals = kerbalAges.Keys
+                .Where(name => IsKerbalExcluded(name))
+                .ToList();
+
+            foreach (string kerbal in excludedKerbals)
+            {
+                kerbalAges.Remove(kerbal);
+                Debug.Log($"[KerbalAgingMod] Removed excluded kerbal '{kerbal}' from aging data.");
             }
         }
 
@@ -274,6 +280,13 @@ public class KerbalAgingMod : ScenarioModule
         if (HighLogic.CurrentGame == null) return;
         EnsureKerbalAgesAssigned();
 
+        // Call FixFrozenMarkedDead only once after DeepFreeze is initialized
+        if (!fixedFrozenKerbals && dfInitialized && DFWrapper.APIReady)
+        {
+            FixFrozenMarkedDead();
+            fixedFrozenKerbals = true;
+        }
+
         if (lastUpdateUT < 0)
         {
             lastUpdateUT = currentUT;
@@ -299,7 +312,9 @@ public class KerbalAgingMod : ScenarioModule
             if (pcm != null && kerbalAges.ContainsKey(pcm.name))
             {
                 KerbalData data = kerbalAges[pcm.name];
-                if (data.isAlive)
+
+                // FIX: Ensure the kerbal is not frozen and not excluded before marking as dead
+                if (data.isAlive && !IsKerbalFrozen(pcm.name) && !IsKerbalExcluded(pcm))
                 {
                     data.isAlive = false;
                     data.deathAge = data.currentAge;
@@ -316,17 +331,43 @@ public class KerbalAgingMod : ScenarioModule
     // -----------------------------------------------------------------------
     private void EnsureKerbalAgesAssigned()
     {
-        var roster = HighLogic.CurrentGame.CrewRoster.Crew;
+        // Iterate through all relevant roster lists
+        List<ProtoCrewMember> allKerbals = new List<ProtoCrewMember>();
+        allKerbals.AddRange(HighLogic.CurrentGame.CrewRoster.Crew);
+
         int currentYear = (int)(Planetarium.GetUniversalTime() / KERBIN_YEAR_SECONDS) + 1;
 
-        foreach (ProtoCrewMember pcm in roster)
+        foreach (ProtoCrewMember pcm in allKerbals)
         {
-            // Skip tourists if you like
-            if (pcm.trait == "Tourist") continue;
+            // Skip excluded kerbals (Tourists and Applicants)
+            if (IsKerbalExcluded(pcm)) continue;
 
             // If not in our dictionary, assign new data
             if (!kerbalAges.ContainsKey(pcm.name))
             {
+                bool isFrozen = IsKerbalFrozen(pcm.name);
+
+                // Handle frozen kerbals separately
+                if (isFrozen)
+                {
+                    // If kerbal is frozen but not in the dictionary, assign them as alive and frozen
+                    kerbalAges[pcm.name] = new KerbalData
+                    {
+                        currentAge = UnityEngine.Random.Range(startAgeMin, startAgeMax + 1),
+                        deathAge = UnityEngine.Random.Range(deathAgeMin, deathAgeMax + 1),
+                        isAlive = true,
+                        birthday = UnityEngine.Random.Range(1, 426),
+                        yearAdded = currentYear,
+                        birthYear = currentYear - UnityEngine.Random.Range(startAgeMin, startAgeMax + 1),
+                        blessed = (UnityEngine.Random.Range(0, 50) == 0), // 1 in 50 chance
+                        immortal = false,
+                        unknownBirth = false,
+                        unknownDeath = false,
+                        deathUT = -1
+                    };
+                    continue;
+                }
+
                 int randomBirthday = UnityEngine.Random.Range(1, 426);
                 if (pcm.rosterStatus == ProtoCrewMember.RosterStatus.Dead)
                 {
@@ -375,7 +416,9 @@ public class KerbalAgingMod : ScenarioModule
             {
                 // If the mod says they're alive, but the game says dead, fix that:
                 KerbalData data = kerbalAges[pcm.name];
-                if (data.isAlive && pcm.rosterStatus == ProtoCrewMember.RosterStatus.Dead)
+                bool isFrozen = IsKerbalFrozen(pcm.name);
+
+                if (data.isAlive && pcm.rosterStatus == ProtoCrewMember.RosterStatus.Dead && !isFrozen)
                 {
                     data.isAlive = false;
                     data.deathAge = data.currentAge;
@@ -384,38 +427,42 @@ public class KerbalAgingMod : ScenarioModule
             }
         }
 
-        // Check for Kerbals in DeepFreeze
-        if (dfInitialized && DFWrapper.APIReady)
-        {
-            var frozenList = DFWrapper.DeepFreezeAPI.FrozenKerbals;
-            foreach (var kvp in frozenList)
-            {
-                string name = kvp.Key;
-                if (!kerbalAges.ContainsKey(name))
-                {
-                    int randomBirthday = UnityEngine.Random.Range(1, 426);
-                    int startAge = UnityEngine.Random.Range(startAgeMin, startAgeMax + 1);
-                    bool blessed = (UnityEngine.Random.Range(0, 50) == 0);
-                    int baseDeathAge = UnityEngine.Random.Range(deathAgeMin, deathAgeMax + 1);
-                    int dAge = blessed ? baseDeathAge + 50 : baseDeathAge;
+        // **New Addition:** Remove any kerbals from the dictionary that are now excluded
+        List<string> excludedKerbals = kerbalAges.Keys
+            .Where(name => IsKerbalExcluded(name))
+            .ToList();
 
-                    kerbalAges[name] = new KerbalData
-                    {
-                        currentAge = startAge,
-                        deathAge = dAge,
-                        isAlive = true,
-                        birthday = randomBirthday,
-                        yearAdded = currentYear,
-                        birthYear = currentYear - startAge,
-                        blessed = blessed,
-                        immortal = false,
-                        unknownBirth = false,
-                        unknownDeath = false,
-                        deathUT = -1
-                    };
-                }
-            }
+        foreach (string kerbal in excludedKerbals)
+        {
+            kerbalAges.Remove(kerbal);
+            Debug.Log($"[KerbalAgingMod] Removed excluded kerbal '{kerbal}' from aging data.");
         }
+    }
+
+    /// <summary>
+    /// Determines if a kerbal should be excluded from the mod (Tourist or Applicant).
+    /// </summary>
+    /// <param name="pcm">The ProtoCrewMember to check.</param>
+    /// <returns>True if the kerbal is a Tourist or Applicant; otherwise, false.</returns>
+    private bool IsKerbalExcluded(ProtoCrewMember pcm)
+    {
+        if (pcm == null)
+            return false;
+
+        // Exclude based on trait and roster status
+        return pcm.trait.Equals("Tourist", StringComparison.OrdinalIgnoreCase) ||
+               HighLogic.CurrentGame.CrewRoster.Applicants.Contains(pcm);
+    }
+
+    /// <summary>
+    /// Determines if a kerbal is a Tourist or Applicant by name.
+    /// </summary>
+    /// <param name="kerbalName">The name of the kerbal.</param>
+    /// <returns>True if the kerbal is a Tourist or Applicant; otherwise, false.</returns>
+    private bool IsKerbalExcluded(string kerbalName)
+    {
+        var pcm = HighLogic.CurrentGame?.CrewRoster[kerbalName];
+        return IsKerbalExcluded(pcm);
     }
 
     private bool IsKerbalFrozen(string kerbalName)
@@ -489,6 +536,13 @@ public class KerbalAgingMod : ScenarioModule
     /// </summary>
     private void MarkKerbalDead(string kerbalName, bool discoveredOffline)
     {
+        // FIX: Ensure the kerbal is not frozen and not excluded before marking as dead
+        if (IsKerbalFrozen(kerbalName) || IsKerbalExcluded(kerbalName))
+        {
+            Debug.Log($"[KerbalAgingMod] Attempted to mark frozen or excluded kerbal '{kerbalName}' as dead. Operation aborted.");
+            return;
+        }
+
         var pcm = HighLogic.CurrentGame?.CrewRoster?[kerbalName];
         if (pcm != null)
         {
@@ -550,17 +604,14 @@ public class KerbalAgingMod : ScenarioModule
         // Gather all kerbals from the existing lists
         List<ProtoCrewMember> allKerbals = new List<ProtoCrewMember>();
         allKerbals.AddRange(roster.Crew);
-        allKerbals.AddRange(roster.Tourist);
-        allKerbals.AddRange(roster.Unowned);
-        allKerbals.AddRange(roster.Applicants);
-        // Remove these lines if your version of KSP doesn’t have them:
-        // allKerbals.AddRange(roster.Killed);
-        // allKerbals.AddRange(roster.Missing);
 
         // If they are flagged Dead by the game but not in our dictionary (or incorrectly in our dictionary),
         // mark them with unknown death info.
         foreach (ProtoCrewMember pcm in allKerbals)
         {
+            // FIX: Skip excluded kerbals (Tourists and Applicants) and frozen kerbals
+            if (IsKerbalExcluded(pcm) || IsKerbalFrozen(pcm.name)) continue;
+
             if (pcm.rosterStatus == ProtoCrewMember.RosterStatus.Dead)
             {
                 // If not in our dictionary => brand new discovery
@@ -587,11 +638,52 @@ public class KerbalAgingMod : ScenarioModule
                     // In dictionary but says isAlive => must correct it
                     if (data.isAlive)
                     {
-                        data.isAlive = false;
-                        data.deathAge = data.currentAge;
-                        // Because we only just discovered it, treat it as unknown
-                        MarkKerbalDead(pcm.name, discoveredOffline: true);
+                        // FIX: Ensure the kerbal is not frozen or excluded before marking as dead
+                        if (!IsKerbalFrozen(pcm.name) && !IsKerbalExcluded(pcm))
+                        {
+                            data.isAlive = false;
+                            data.deathAge = data.currentAge;
+                            // Because we only just discovered it, treat it as unknown
+                            MarkKerbalDead(pcm.name, discoveredOffline: true);
+                        }
                     }
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // NEW: Fix kerbals mistakenly marked as dead but are frozen
+    // -----------------------------------------------------------------------
+    private void FixFrozenMarkedDead()
+    {
+        var frozenList = DFWrapper.DeepFreezeAPI.FrozenKerbals;
+        if (frozenList == null || frozenList.Count == 0) return;
+
+        foreach (var kvp in frozenList)
+        {
+            string kerbalName = kvp.Key;
+
+            if (kerbalAges.ContainsKey(kerbalName))
+            {
+                KerbalData data = kerbalAges[kerbalName];
+                if (!data.isAlive)
+                {
+                    Debug.Log($"[KerbalAgingMod] Fixing kerbal '{kerbalName}' mistakenly marked as dead while frozen.");
+
+                    // Set alive
+                    data.isAlive = true;
+
+                    // Clear death UT
+                    data.deathUT = -1;
+
+                    // Set unknownDeath to false, since death is now cleared
+                    data.unknownDeath = false;
+
+                    // Assign a new random deathAge
+                    data.deathAge = UnityEngine.Random.Range(deathAgeMin, deathAgeMax + 1);
+
+                    Debug.Log($"[KerbalAgingMod] Assigned new death age {data.deathAge} to kerbal '{kerbalName}'.");
                 }
             }
         }
@@ -760,6 +852,12 @@ public class KerbalAgingMod : ScenarioModule
         foreach (var kvp in kerbalAges)
         {
             KerbalData data = kvp.Value;
+
+            // Exclude kerbals that should not be displayed
+            ProtoCrewMember pcm = HighLogic.CurrentGame.CrewRoster[kvp.Key];
+            if (pcm == null) continue;
+            if (IsKerbalExcluded(pcm)) continue;
+
             if ((showAlive && data.isAlive) || (!showAlive && !data.isAlive))
             {
                 list.Add(kvp);
@@ -931,6 +1029,12 @@ public class KerbalAgingMod : ScenarioModule
     // -----------------------------------------------------------------------
     private void DrawSettingsTab()
     {
+        GUILayout.BeginHorizontal();
+        GUILayout.Label("Configure Kerbal Aging Ranges:", headerStyle);
+        GUILayout.EndHorizontal();
+
+        GUILayout.Space(10);
+
         settingsScrollPos = GUILayout.BeginScrollView(settingsScrollPos, GUILayout.ExpandHeight(true));
 
         if (settingsLocked)
@@ -1026,7 +1130,7 @@ public class KerbalAgingMod : ScenarioModule
             {
                 data.deathAge = UnityEngine.Random.Range(deathAgeMin, deathAgeMax + 1);
                 // If the new range instantly kills them:
-                if (data.currentAge >= data.deathAge && !data.immortal)
+                if (data.currentAge >= data.deathAge && !data.immortal && !IsKerbalFrozen(kvp.Key))
                 {
                     data.isAlive = false;
                     MarkKerbalDead(kvp.Key, discoveredOffline: false);
@@ -1050,11 +1154,32 @@ public class KerbalAgingMod : ScenarioModule
         foreach (var kvp in kerbalAges)
         {
             var data = kvp.Value;
-            if (!data.isAlive) continue;
-            if (GUILayout.Button(kvp.Key, GUILayout.Width(220)))
+
+            // Exclude kerbals that should not be displayed
+            ProtoCrewMember pcm = HighLogic.CurrentGame.CrewRoster[kvp.Key];
+            if (pcm == null) continue;
+            if (IsKerbalExcluded(pcm)) continue;
+
+            if (data.isAlive)
             {
-                selectedKerbal = kvp.Key;
-                debugAgeInput = data.currentAge.ToString();
+                // Include frozen kerbals in the debug menu
+                if (IsKerbalFrozen(kvp.Key))
+                {
+                    // Indicate they are frozen
+                    if (GUILayout.Button($"{kvp.Key} (FROZEN)", GUILayout.Width(220)))
+                    {
+                        selectedKerbal = kvp.Key;
+                        debugAgeInput = data.currentAge.ToString();
+                    }
+                }
+                else
+                {
+                    if (GUILayout.Button(kvp.Key, GUILayout.Width(220)))
+                    {
+                        selectedKerbal = kvp.Key;
+                        debugAgeInput = data.currentAge.ToString();
+                    }
+                }
             }
         }
 
@@ -1088,7 +1213,7 @@ public class KerbalAgingMod : ScenarioModule
                         data.birthYear = data.yearAdded - data.currentAge;
 
                         // If that kills them
-                        if (data.currentAge >= data.deathAge && !data.immortal)
+                        if (data.currentAge >= data.deathAge && !data.immortal && !IsKerbalFrozen(selectedKerbal))
                         {
                             data.isAlive = false;
                             MarkKerbalDead(selectedKerbal, discoveredOffline: false);
@@ -1107,8 +1232,12 @@ public class KerbalAgingMod : ScenarioModule
                     {
                         if (int.TryParse(debugFrozenInput, out int frozenYears))
                         {
+                            // Simulate adding frozen years by decreasing age
                             data.currentAge = Mathf.Max(0, data.currentAge - frozenYears);
-                            if (data.currentAge >= data.deathAge && !data.immortal)
+                            data.birthYear = data.yearAdded - data.currentAge;
+
+                            // If that kills them
+                            if (data.currentAge >= data.deathAge && !data.immortal && !IsKerbalFrozen(selectedKerbal))
                             {
                                 data.isAlive = false;
                                 MarkKerbalDead(selectedKerbal, discoveredOffline: false);

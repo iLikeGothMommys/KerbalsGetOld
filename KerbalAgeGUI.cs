@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using UnityEngine;
@@ -92,7 +92,7 @@ public class KerbalAgingMod : ScenarioModule
     private Vector2 settingsScrollPos = Vector2.zero;
 
     private bool dfInitialized = false;
-    private bool dfInitAttempted = false;  // NEW: Flag to ensure one-time initialization attempt
+    private bool dfInitAttempted = false;  // Flag to ensure one-time initialization attempt
 
     // Reordered enum to match desired cycle order
     private enum SortMode { OldestFirst, YoungestFirst, AZ, ZA, Frozen }
@@ -251,6 +251,15 @@ public class KerbalAgingMod : ScenarioModule
         }
     }
 
+    // ── NEW: Throttling crew roster updates ──
+    private double crewRosterUpdateInterval = 60.0; // Update crew roster every 60 UT seconds
+    private double nextCrewRosterUpdateTime = 0.0;
+
+    // ── NEW: Cached frozen kerbals (to avoid repeated DFWrapper API calls) ──
+    private Dictionary<string, DFWrapper.KerbalInfo> cachedFrozenKerbals = null;
+
+
+
     public void Update()
     {
         double currentUT = Planetarium.GetUniversalTime();
@@ -260,14 +269,38 @@ public class KerbalAgingMod : ScenarioModule
         if (!dfInitialized && !dfInitAttempted)
         {
             dfInitialized = DFWrapper.InitDFWrapper();
-            dfInitAttempted = true;  // Mark that we've attempted initialization
+            dfInitAttempted = true;
             Debug.Log(dfInitialized
                 ? "[KerbalAgingMod] DeepFreeze successfully initialized."
                 : "[KerbalAgingMod] DeepFreeze initialization failed or not installed.");
         }
 
+        // Throttle crew roster updates
+        if (currentUT >= nextCrewRosterUpdateTime)
+        {
+            EnsureKerbalAgesAssigned();
+            nextCrewRosterUpdateTime = currentUT + crewRosterUpdateInterval;
+        }
+
+        // Cache the FrozenKerbals dictionary once per update
+        if (dfInitialized && DFWrapper.APIReady)
+        {
+            try
+            {
+                cachedFrozenKerbals = DFWrapper.DeepFreezeAPI.FrozenKerbals;
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError("[KerbalAgingMod] Error caching frozen kerbals: " + ex);
+                cachedFrozenKerbals = null;
+            }
+        }
+        else
+        {
+            cachedFrozenKerbals = null;
+        }
+
         if (HighLogic.CurrentGame == null) return;
-        EnsureKerbalAgesAssigned();
 
         if (lastUpdateUT < 0)
         {
@@ -343,10 +376,9 @@ public class KerbalAgingMod : ScenarioModule
             }
         }
 
-        if (dfInitialized && DFWrapper.APIReady)
+        if (dfInitialized && DFWrapper.APIReady && cachedFrozenKerbals != null)
         {
-            var frozenList = DFWrapper.DeepFreezeAPI.FrozenKerbals;
-            foreach (var kvp in frozenList)
+            foreach (var kvp in cachedFrozenKerbals)
             {
                 string name = kvp.Key;
                 if (!kerbalAges.ContainsKey(name))
@@ -378,16 +410,8 @@ public class KerbalAgingMod : ScenarioModule
 
     private bool IsKerbalFrozen(string kerbalName)
     {
-        try
-        {
-            if (DFWrapper.APIReady)
-            {
-                var frozen = DFWrapper.DeepFreezeAPI.FrozenKerbals;
-                if (frozen != null && frozen.ContainsKey(kerbalName))
-                    return true;
-            }
-        }
-        catch (Exception) { }
+        if (DFWrapper.APIReady && cachedFrozenKerbals != null)
+            return cachedFrozenKerbals.ContainsKey(kerbalName);
         return false;
     }
 
@@ -516,7 +540,7 @@ public class KerbalAgingMod : ScenarioModule
             statusStyle = new GUIStyle(columnStyle)
             {
                 alignment = TextAnchor.MiddleCenter,
-                padding = new RectOffset(0, 5, 0, 0)  // Slight right padding
+                padding = new RectOffset(0, 5, 0, 0)
             };
         }
 
@@ -639,16 +663,13 @@ public class KerbalAgingMod : ScenarioModule
                 break;
             case SortMode.OldestFirst:
                 list.Sort((a, b) => {
-                    // First compare current ages
                     int ageComparison = b.Value.currentAge.CompareTo(a.Value.currentAge);
                     if (ageComparison != 0)
                         return ageComparison;
 
-                    // If ages are equal, then compare birth years
                     if (a.Value.birthYear != b.Value.birthYear)
                         return a.Value.birthYear.CompareTo(b.Value.birthYear);
 
-                    // If birth years are equal, compare birth days
                     if (a.Value.birthYear <= 0)
                         return b.Value.birthday.CompareTo(a.Value.birthday);
                     return a.Value.birthday.CompareTo(b.Value.birthday);
@@ -656,16 +677,13 @@ public class KerbalAgingMod : ScenarioModule
                 break;
             case SortMode.YoungestFirst:
                 list.Sort((a, b) => {
-                    // First compare current ages
                     int ageComparison = a.Value.currentAge.CompareTo(b.Value.currentAge);
                     if (ageComparison != 0)
                         return ageComparison;
 
-                    // If ages are equal, then compare birth years
                     if (a.Value.birthYear != b.Value.birthYear)
                         return b.Value.birthYear.CompareTo(a.Value.birthYear);
 
-                    // If birth years are equal, compare birth days
                     if (a.Value.birthYear <= 0)
                         return a.Value.birthday.CompareTo(b.Value.birthday);
                     return b.Value.birthday.CompareTo(a.Value.birthday);
@@ -968,10 +986,6 @@ public class KerbalAgingMod : ScenarioModule
         return style;
     }
 }
-
-
-
-
 
 
 

@@ -206,6 +206,10 @@ public class KerbalAgingMod : ScenarioModule
         startAgeMaxStr = startAgeMax.ToString();
         deathAgeMinStr = deathAgeMin.ToString();
         deathAgeMaxStr = deathAgeMax.ToString();
+
+        // Clean up any kerbals that should not be in our aging list.
+        if (HighLogic.CurrentGame != null)
+            CleanKerbalAges();
     }
 
     public override void OnSave(ConfigNode node)
@@ -258,7 +262,23 @@ public class KerbalAgingMod : ScenarioModule
     // ── NEW: Cached frozen kerbals (to avoid repeated DFWrapper API calls) ──
     private Dictionary<string, DFWrapper.KerbalInfo> cachedFrozenKerbals = null;
 
-
+    // ── NEW: Helper method to clean the aging list ──
+    private void CleanKerbalAges()
+    {
+        if (HighLogic.CurrentGame == null) return;
+        var roster = HighLogic.CurrentGame.CrewRoster;
+        // We work on a copy of the keys so we can remove items from the dictionary safely.
+        foreach (string key in kerbalAges.Keys.ToList())
+        {
+            ProtoCrewMember pcm = roster[key];
+            // Remove kerbals that are not in our crew roster or are Tourists.
+            if (pcm == null || pcm.trait == "Tourist")
+            {
+                kerbalAges.Remove(key);
+                Debug.Log("[KerbalAgingMod] Removing kerbal " + key + " from aging list because they are not fully recruited or are a Tourist.");
+            }
+        }
+    }
 
     public void Update()
     {
@@ -275,7 +295,7 @@ public class KerbalAgingMod : ScenarioModule
                 : "[KerbalAgingMod] DeepFreeze initialization failed or not installed.");
         }
 
-        // Throttle crew roster updates
+        // Throttle crew roster updates and clean our list each update
         if (currentUT >= nextCrewRosterUpdateTime)
         {
             EnsureKerbalAgesAssigned();
@@ -314,10 +334,14 @@ public class KerbalAgingMod : ScenarioModule
 
     private void EnsureKerbalAgesAssigned()
     {
+        // First, clean out any entries that are no longer valid.
+        CleanKerbalAges();
+
         var roster = HighLogic.CurrentGame.CrewRoster.Crew;
         int currentYear = (int)(Planetarium.GetUniversalTime() / KERBIN_YEAR_SECONDS) + 1;
         foreach (ProtoCrewMember pcm in roster)
         {
+            // Only add fully recruited (non-Tourist) kerbals.
             if (pcm.trait == "Tourist") continue;
 
             if (!kerbalAges.ContainsKey(pcm.name))
@@ -381,6 +405,10 @@ public class KerbalAgingMod : ScenarioModule
             foreach (var kvp in cachedFrozenKerbals)
             {
                 string name = kvp.Key;
+                // Check that the frozen kerbal is fully recruited and not a Tourist.
+                ProtoCrewMember pcm = HighLogic.CurrentGame.CrewRoster[name];
+                if (pcm == null || pcm.trait == "Tourist")
+                    continue;
                 if (!kerbalAges.ContainsKey(name))
                 {
                     int randomBirthday = UnityEngine.Random.Range(1, 426);
@@ -598,6 +626,10 @@ public class KerbalAgingMod : ScenarioModule
 
     private void DrawKerbalListTab()
     {
+        // Ensure our list is clean.
+        if (HighLogic.CurrentGame != null)
+            CleanKerbalAges();
+
         GUILayout.BeginHorizontal();
         if (GUILayout.Button(showAlive ? "Show Deceased" : "Show Alive", GUILayout.Width(120)))
         {
@@ -636,19 +668,17 @@ public class KerbalAgingMod : ScenarioModule
             GUILayout.EndHorizontal();
         }
 
+        // Only include kerbals that are fully recruited (i.e. exist in the crew roster)
         List<KeyValuePair<string, KerbalData>> list = new List<KeyValuePair<string, KerbalData>>();
         foreach (var kvp in kerbalAges)
         {
+            ProtoCrewMember pcm = HighLogic.CurrentGame.CrewRoster[kvp.Key];
+            if (pcm == null || pcm.trait == "Tourist")
+                continue;
             KerbalData data = kvp.Value;
             bool alive = data.isAlive;
             if ((showAlive && alive) || (!showAlive && !alive))
             {
-                if (showAlive && alive)
-                {
-                    ProtoCrewMember pcm = HighLogic.CurrentGame.CrewRoster[kvp.Key];
-                    if (pcm != null && pcm.trait == "Tourist" && IsKerbalFrozen(kvp.Key))
-                        continue;
-                }
                 list.Add(kvp);
             }
         }
@@ -881,8 +911,12 @@ public class KerbalAgingMod : ScenarioModule
         GUILayout.Label("Manual Kerbal Age Adjustment:");
         debugScrollPos = GUILayout.BeginScrollView(debugScrollPos, GUILayout.Height(150));
 
+        // Only list kerbals that are fully recruited (non-Tourist)
         foreach (var kvp in kerbalAges)
         {
+            ProtoCrewMember pcm = HighLogic.CurrentGame.CrewRoster[kvp.Key];
+            if (pcm == null || pcm.trait == "Tourist")
+                continue;
             var data = kvp.Value;
             if (!data.isAlive) continue;
 
@@ -986,6 +1020,3 @@ public class KerbalAgingMod : ScenarioModule
         return style;
     }
 }
-
-
-

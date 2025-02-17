@@ -16,15 +16,11 @@ using AGING_DFWrapper;
 )]
 public class KerbalAgingMod : ScenarioModule
 {
-    // UI Styles for prettier appearance
     private GUIStyle headerStyle;
     private GUIStyle rowStyle;
     private GUIStyle columnStyle;
-    private GUIStyle statusStyle;  // Dedicated style for the STATUS column
+    private GUIStyle statusStyle;
 
-    // -----------------------------------------------------------------------
-    // 1. Internal Data for Each Kerbal
-    // -----------------------------------------------------------------------
     private class KerbalData
     {
         public int currentAge;
@@ -34,8 +30,7 @@ public class KerbalAgingMod : ScenarioModule
         public int yearAdded;
         public int birthYear;
         public bool blessed;
-        public bool immortal;   // Immortal flag for debug
-
+        public bool immortal;
         public double deathUT;
         public bool unknownDeath;
         public bool unknownBirth;
@@ -46,9 +41,6 @@ public class KerbalAgingMod : ScenarioModule
     private const double KERBIN_YEAR_SECONDS = 426.0 * 6.0 * 3600.0;
     private double lastUpdateUT = -1;
 
-    // -----------------------------------------------------------------------
-    // 2. Configurable Ranges (Defaults)
-    // -----------------------------------------------------------------------
     private int startAgeMin = 22;
     private int startAgeMax = 35;
     private int deathAgeMin = 300;
@@ -59,29 +51,22 @@ public class KerbalAgingMod : ScenarioModule
     private string deathAgeMinStr = "350";
     private string deathAgeMaxStr = "370";
 
-    // -----------------------------------------------------------------------
-    // 3. Lock Settings
-    // -----------------------------------------------------------------------
     private bool settingsLocked = false;
     private bool showLockConfirm = false;
 
-    // -----------------------------------------------------------------------
-    // 4. Stock Toolbar Button
-    // -----------------------------------------------------------------------
     private ApplicationLauncherButton appButton;
 
-    // -----------------------------------------------------------------------
-    // 5. IMGUI Window Fields
-    // -----------------------------------------------------------------------
     private bool showGUI = false;
     private Rect windowRect = new Rect(100, 100, 720, 500);
     private readonly int windowID = 12345678;
 
-    private enum GuiTab { KerbalList, Settings }
-    private GuiTab currentTab = GuiTab.KerbalList;
+    private enum GuiTab { Kerbals, Settings }
+    private GuiTab currentTab = GuiTab.Kerbals;
 
     private bool showAlive = true;
     private Vector2 listScrollPos = Vector2.zero;
+
+    private string searchQuery = "";
 
     private bool showDebug = false;
     private Vector2 debugScrollPos = Vector2.zero;
@@ -92,10 +77,9 @@ public class KerbalAgingMod : ScenarioModule
     private Vector2 settingsScrollPos = Vector2.zero;
 
     private bool dfInitialized = false;
-    private bool dfInitAttempted = false;  // Flag to ensure one-time initialization attempt
+    private bool dfInitAttempted = false;
 
-    // Reordered enum to match desired cycle order
-    private enum SortMode { OldestFirst, YoungestFirst, AZ, ZA, Frozen }
+    private enum SortMode { OldestFirst, YoungestFirst, AZ, ZA, Frozen, ActiveVessel }
     private SortMode currentSort = SortMode.OldestFirst;
 
     private void CycleSortMode()
@@ -116,6 +100,7 @@ public class KerbalAgingMod : ScenarioModule
             case SortMode.OldestFirst: return "Oldest First";
             case SortMode.YoungestFirst: return "Youngest First";
             case SortMode.Frozen: return "Frozen";
+            case SortMode.ActiveVessel: return "Active Vessel";
             default: return "";
         }
     }
@@ -207,7 +192,6 @@ public class KerbalAgingMod : ScenarioModule
         deathAgeMinStr = deathAgeMin.ToString();
         deathAgeMaxStr = deathAgeMax.ToString();
 
-        // Clean up any kerbals that should not be in our aging list.
         if (HighLogic.CurrentGame != null)
             CleanKerbalAges();
     }
@@ -255,27 +239,22 @@ public class KerbalAgingMod : ScenarioModule
         }
     }
 
-    // ── NEW: Throttling crew roster updates ──
-    private double crewRosterUpdateInterval = 60.0; // Update crew roster every 60 UT seconds
+    private double crewRosterUpdateInterval = 60.0;
     private double nextCrewRosterUpdateTime = 0.0;
 
-    // ── NEW: Cached frozen kerbals (to avoid repeated DFWrapper API calls) ──
     private Dictionary<string, DFWrapper.KerbalInfo> cachedFrozenKerbals = null;
 
-    // ── NEW: Helper method to clean the aging list ──
     private void CleanKerbalAges()
     {
         if (HighLogic.CurrentGame == null) return;
         var roster = HighLogic.CurrentGame.CrewRoster;
-        // We work on a copy of the keys so we can remove items from the dictionary safely.
         foreach (string key in kerbalAges.Keys.ToList())
         {
             ProtoCrewMember pcm = roster[key];
-            // Remove kerbals that are not in our crew roster or are Tourists.
             if (pcm == null || pcm.trait == "Tourist")
             {
                 kerbalAges.Remove(key);
-                Debug.Log("[KerbalAgingMod] Removing kerbal " + key + " from aging list because they are not fully recruited or are a Tourist.");
+                Debug.Log("[KerbalAgingMod] Removing kerbal " + key);
             }
         }
     }
@@ -285,7 +264,6 @@ public class KerbalAgingMod : ScenarioModule
         double currentUT = Planetarium.GetUniversalTime();
         if (currentUT <= 0) return;
 
-        // Attempt DeepFreeze initialization only once
         if (!dfInitialized && !dfInitAttempted)
         {
             dfInitialized = DFWrapper.InitDFWrapper();
@@ -295,14 +273,12 @@ public class KerbalAgingMod : ScenarioModule
                 : "[KerbalAgingMod] DeepFreeze initialization failed or not installed.");
         }
 
-        // Throttle crew roster updates and clean our list each update
         if (currentUT >= nextCrewRosterUpdateTime)
         {
             EnsureKerbalAgesAssigned();
             nextCrewRosterUpdateTime = currentUT + crewRosterUpdateInterval;
         }
 
-        // Cache the FrozenKerbals dictionary once per update
         if (dfInitialized && DFWrapper.APIReady)
         {
             try
@@ -334,14 +310,12 @@ public class KerbalAgingMod : ScenarioModule
 
     private void EnsureKerbalAgesAssigned()
     {
-        // First, clean out any entries that are no longer valid.
         CleanKerbalAges();
 
         var roster = HighLogic.CurrentGame.CrewRoster.Crew;
         int currentYear = (int)(Planetarium.GetUniversalTime() / KERBIN_YEAR_SECONDS) + 1;
         foreach (ProtoCrewMember pcm in roster)
         {
-            // Only add fully recruited (non-Tourist) kerbals.
             if (pcm.trait == "Tourist") continue;
 
             if (!kerbalAges.ContainsKey(pcm.name))
@@ -405,7 +379,6 @@ public class KerbalAgingMod : ScenarioModule
             foreach (var kvp in cachedFrozenKerbals)
             {
                 string name = kvp.Key;
-                // Check that the frozen kerbal is fully recruited and not a Tourist.
                 ProtoCrewMember pcm = HighLogic.CurrentGame.CrewRoster[name];
                 if (pcm == null || pcm.trait == "Tourist")
                     continue;
@@ -596,8 +569,8 @@ public class KerbalAgingMod : ScenarioModule
     private void WindowFunction(int id)
     {
         GUILayout.BeginHorizontal();
-        if (GUILayout.Toggle(currentTab == GuiTab.KerbalList, "Kerbal List", GUI.skin.button, GUILayout.Width(100)))
-            currentTab = GuiTab.KerbalList;
+        if (GUILayout.Toggle(currentTab == GuiTab.Kerbals, "Kerbals", GUI.skin.button, GUILayout.Width(100)))
+            currentTab = GuiTab.Kerbals;
         if (GUILayout.Toggle(currentTab == GuiTab.Settings, "Settings", GUI.skin.button, GUILayout.Width(100)))
             currentTab = GuiTab.Settings;
         GUILayout.FlexibleSpace();
@@ -613,7 +586,7 @@ public class KerbalAgingMod : ScenarioModule
 
         switch (currentTab)
         {
-            case GuiTab.KerbalList:
+            case GuiTab.Kerbals:
                 DrawKerbalListTab();
                 break;
             case GuiTab.Settings:
@@ -626,7 +599,6 @@ public class KerbalAgingMod : ScenarioModule
 
     private void DrawKerbalListTab()
     {
-        // Ensure our list is clean.
         if (HighLogic.CurrentGame != null)
             CleanKerbalAges();
 
@@ -640,6 +612,15 @@ public class KerbalAgingMod : ScenarioModule
         {
             CycleSortMode();
             listScrollPos = Vector2.zero;
+        }
+        {
+            GUI.SetNextControlName("SearchField");
+            Rect searchRect = GUILayoutUtility.GetRect(new GUIContent(searchQuery), GUI.skin.textField, GUILayout.Width(150));
+            searchQuery = GUI.TextField(searchRect, searchQuery, GUI.skin.textField);
+            if (string.IsNullOrEmpty(searchQuery) && GUI.GetNameOfFocusedControl() != "SearchField")
+            {
+                GUI.Label(searchRect, "Search", new GUIStyle(GUI.skin.textField) { normal = { textColor = Color.gray } });
+            }
         }
         GUILayout.EndHorizontal();
 
@@ -668,7 +649,6 @@ public class KerbalAgingMod : ScenarioModule
             GUILayout.EndHorizontal();
         }
 
-        // Only include kerbals that are fully recruited (i.e. exist in the crew roster)
         List<KeyValuePair<string, KerbalData>> list = new List<KeyValuePair<string, KerbalData>>();
         foreach (var kvp in kerbalAges)
         {
@@ -677,6 +657,11 @@ public class KerbalAgingMod : ScenarioModule
                 continue;
             KerbalData data = kvp.Value;
             bool alive = data.isAlive;
+            if (!string.IsNullOrEmpty(searchQuery) &&
+                !kvp.Key.ToLower().Contains(searchQuery.ToLower()))
+            {
+                continue;
+            }
             if ((showAlive && alive) || (!showAlive && !alive))
             {
                 list.Add(kvp);
@@ -723,6 +708,16 @@ public class KerbalAgingMod : ScenarioModule
                 list = list.Where(kvp => IsKerbalFrozen(kvp.Key))
                            .OrderBy(kvp => kvp.Key)
                            .ToList();
+                break;
+            case SortMode.ActiveVessel:
+                list = list.Where(kvp =>
+                {
+                    if (FlightGlobals.ActiveVessel != null)
+                    {
+                        return FlightGlobals.ActiveVessel.GetVesselCrew().Any(pcm => pcm.name == kvp.Key);
+                    }
+                    return false;
+                }).OrderBy(kvp => kvp.Key).ToList();
                 break;
         }
 
@@ -847,8 +842,7 @@ public class KerbalAgingMod : ScenarioModule
             }
             else
             {
-                GUILayout.Label("<color=#FF0000>WARNING: ONCE SETTINGS ARE LOCKED THEY CAN NOT BE UNLOCKED.\n" +
-                                "THIS WILL DISABLE THE DEBUG MENU.\nARE YOU SURE YOU WANT TO LOCK YOUR SETTINGS?</color>");
+                GUILayout.Label("<color=#FF0000>WARNING: ONCE SETTINGS ARE LOCKED THEY CAN NOT BE UNLOCKED.\nTHIS WILL DISABLE THE DEBUG MENU.\nARE YOU SURE YOU WANT TO LOCK YOUR SETTINGS?</color>");
 
                 GUILayout.BeginHorizontal();
                 if (GUILayout.Button("Yes", GUILayout.Width(80)))
@@ -911,7 +905,6 @@ public class KerbalAgingMod : ScenarioModule
         GUILayout.Label("Manual Kerbal Age Adjustment:");
         debugScrollPos = GUILayout.BeginScrollView(debugScrollPos, GUILayout.Height(150));
 
-        // Only list kerbals that are fully recruited (non-Tourist)
         foreach (var kvp in kerbalAges)
         {
             ProtoCrewMember pcm = HighLogic.CurrentGame.CrewRoster[kvp.Key];

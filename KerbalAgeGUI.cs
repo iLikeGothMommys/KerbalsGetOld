@@ -476,7 +476,20 @@ public class KerbalAgingMod : ScenarioModule
     {
         if (ApplicationLauncher.Instance == null || appButton != null) return;
         appButton = ApplicationLauncher.Instance.AddModApplication(
-            onTrue: () => { currentViewMode = "All"; showGUI = true; },
+            onTrue: () =>
+            {
+                // Set default view mode on open.
+                if (HighLogic.LoadedSceneIsFlight && FlightGlobals.ActiveVessel != null &&
+                    FlightGlobals.ActiveVessel.GetVesselCrew().Any(p => p.trait != "Tourist"))
+                {
+                    currentViewMode = "Active Vessel";
+                }
+                else
+                {
+                    currentViewMode = "All";
+                }
+                showGUI = true;
+            },
             onFalse: () => { showGUI = false; },
             onHover: null,
             onHoverOut: null,
@@ -585,32 +598,66 @@ public class KerbalAgingMod : ScenarioModule
             CycleSortMode();
             listScrollPos = Vector2.zero;
         }
-        // VIEW button: cycles through dynamic view options
+        // Build VIEW button options:
+        List<string> viewOptions = new List<string>();
+
+        // Determine if we are in flight and have a valid active vessel with at least one non-tourist kerbal.
+        bool showActiveVessel = false;
+        if (showAlive && HighLogic.LoadedSceneIsFlight)
         {
-            List<string> viewOptions = new List<string>();
-            viewOptions.Add("All");
-            viewOptions.Add("Frozen");
-            viewOptions.Add("Active Vessel");
-            foreach (var kvp in kerbalAges)
+            Vessel active = FlightGlobals.ActiveVessel;
+            if (active != null)
             {
-                ProtoCrewMember pcm = HighLogic.CurrentGame.CrewRoster[kvp.Key];
-                if (pcm == null || pcm.trait == "Tourist") continue;
-                string role = pcm.trait;
-                if (!viewOptions.Contains(role))
-                    viewOptions.Add(role);
-            }
-            List<string> fixedOptions = viewOptions.Take(3).ToList();
-            List<string> roleOptions = viewOptions.Skip(3).OrderBy(x => x).ToList();
-            viewOptions = fixedOptions.Concat(roleOptions).ToList();
-            if (GUILayout.Button("VIEW: " + currentViewMode, GUILayout.Width(160)))
-            {
-                int index = viewOptions.IndexOf(currentViewMode);
-                index = (index + 1) % viewOptions.Count;
-                currentViewMode = viewOptions[index];
-                listScrollPos = Vector2.zero;
+                var nonTouristCrew = active.GetVesselCrew().Where(k => k.trait != "Tourist").ToList();
+                if (nonTouristCrew.Count > 0)
+                    showActiveVessel = true;
             }
         }
-        // Search field
+
+        // For alive kerbals, build role options only from those kerbals;
+        // similarly for deceased kerbals.
+        var roleOptions = kerbalAges.Where(kvp =>
+        {
+            ProtoCrewMember pcm = HighLogic.CurrentGame.CrewRoster[kvp.Key];
+            if (pcm == null || pcm.trait == "Tourist") return false;
+            return (showAlive && kvp.Value.isAlive) || (!showAlive && !kvp.Value.isAlive);
+        })
+        .Select(kvp => HighLogic.CurrentGame.CrewRoster[kvp.Key].trait)
+        .Distinct()
+        .OrderBy(r => r)
+        .ToList();
+
+        // Build the view options list.
+        if (showAlive)
+        {
+            if (showActiveVessel)
+            {
+                viewOptions.Add("Active Vessel");
+                viewOptions.Add("All");
+                viewOptions.Add("Frozen");
+            }
+            else
+            {
+                viewOptions.Add("All");
+                viewOptions.Add("Frozen");
+            }
+        }
+        else
+        {
+            // For deceased kerbals, omit "Frozen".
+            viewOptions.Add("All");
+        }
+        // Add role options.
+        viewOptions.AddRange(roleOptions);
+
+        if (GUILayout.Button("VIEW: " + currentViewMode, GUILayout.Width(160)))
+        {
+            int index = viewOptions.IndexOf(currentViewMode);
+            index = (index + 1) % viewOptions.Count;
+            currentViewMode = viewOptions[index];
+            listScrollPos = Vector2.zero;
+        }
+        // Search field.
         {
             GUI.SetNextControlName("SearchField");
             Rect searchRect = GUILayoutUtility.GetRect(new GUIContent(searchQuery), GUI.skin.textField, GUILayout.Width(150));
@@ -625,7 +672,7 @@ public class KerbalAgingMod : ScenarioModule
         GUILayout.Label(showAlive ? "Alive Kerbals:" : "Deceased Kerbals:");
         GUILayout.Space(5);
         listScrollPos = GUILayout.BeginScrollView(listScrollPos, GUILayout.ExpandHeight(true));
-        // Table header
+        // Table header.
         if (showAlive)
         {
             GUILayout.BeginHorizontal();
@@ -656,7 +703,7 @@ public class KerbalAgingMod : ScenarioModule
             bool alive = data.isAlive;
             if (!string.IsNullOrEmpty(searchQuery) && !kvp.Key.ToLower().Contains(searchQuery.ToLower()))
                 continue;
-            // Apply VIEW filter
+            // Apply VIEW filter.
             if (currentViewMode != "All")
             {
                 if (currentViewMode == "Frozen")
@@ -666,7 +713,23 @@ public class KerbalAgingMod : ScenarioModule
                 }
                 else if (currentViewMode == "Active Vessel")
                 {
-                    if (FlightGlobals.ActiveVessel == null || !FlightGlobals.ActiveVessel.GetVesselCrew().Any(pcm2 => pcm2.name == kvp.Key))
+                    if (FlightGlobals.ActiveVessel == null)
+                        continue;
+                    bool isOnActive = false;
+                    if (!IsKerbalFrozen(kvp.Key))
+                    {
+                        isOnActive = FlightGlobals.ActiveVessel.GetVesselCrew().Any(p => p.name == kvp.Key && p.trait != "Tourist");
+                    }
+                    else
+                    {
+                        DFWrapper.KerbalInfo frozenInfo;
+                        if (cachedFrozenKerbals.TryGetValue(kvp.Key, out frozenInfo))
+                        {
+                            if (frozenInfo.vesselID == FlightGlobals.ActiveVessel.id)
+                                isOnActive = true;
+                        }
+                    }
+                    if (!isOnActive)
                         continue;
                 }
                 else
@@ -678,7 +741,7 @@ public class KerbalAgingMod : ScenarioModule
             if ((showAlive && alive) || (!showAlive && !alive))
                 list.Add(kvp);
         }
-        // Sorting by sort mode (only basic ones)
+        // Sorting by sort mode.
         switch (currentSort)
         {
             case SortMode.AZ:
@@ -726,7 +789,7 @@ public class KerbalAgingMod : ScenarioModule
     {
         GUILayout.BeginHorizontal(rowStyle);
 
-        // Draw Name: if kerbal is alive, use conditional coloring; if deceased, always white.
+        // Draw Name: if alive, use conditional coloring; if deceased, always white.
         if (data.isAlive)
         {
             if (!data.immortal)
@@ -746,7 +809,6 @@ public class KerbalAgingMod : ScenarioModule
         }
         else
         {
-            // Deceased kerbals always appear white.
             GUILayout.Label($"<color=#FFFFFF>{kerbalName}</color>", GUILayout.Width(160));
         }
 
@@ -766,7 +828,6 @@ public class KerbalAgingMod : ScenarioModule
         }
         else
         {
-            // For deceased kerbals, columns: Age at Death, Date of Birth, Date of Death, Skill.
             GUILayout.Label(data.currentAge.ToString(), columnStyle, GUILayout.Width(100));
             GUILayout.Label(GetBirthString(data), columnStyle, GUILayout.Width(150));
 
@@ -896,8 +957,9 @@ public class KerbalAgingMod : ScenarioModule
     private void DrawDebugMenu()
     {
         GUILayout.Label("Manual Kerbal Age Adjustment:");
+        // Order kerbals alphabetically (A to Z) by name.
         debugScrollPos = GUILayout.BeginScrollView(debugScrollPos, GUILayout.Height(150));
-        foreach (var kvp in kerbalAges)
+        foreach (var kvp in kerbalAges.OrderBy(kvp => kvp.Key))
         {
             ProtoCrewMember pcm = HighLogic.CurrentGame.CrewRoster[kvp.Key];
             if (pcm == null || pcm.trait == "Tourist")
@@ -986,12 +1048,5 @@ public class KerbalAgingMod : ScenarioModule
                 GUILayout.EndHorizontal();
             }
         }
-    }
-    private GUIStyle BoldCenteredLabel()
-    {
-        var style = new GUIStyle(GUI.skin.label);
-        style.fontStyle = FontStyle.Bold;
-        style.alignment = TextAnchor.MiddleCenter;
-        return style;
     }
 }
